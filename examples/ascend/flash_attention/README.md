@@ -9,8 +9,9 @@ GQA backward consumes the optional LSE output from forward and retains the
 fastest current path, using `T.Stage` with AutoSchedule. First,
 `flash_attention_bwd_preprocess` computes `Delta = sum(O * dO, axis=-1)` for all
 query rows. A frontend-staged, KV-centric mixed kernel then performs five GEMMs
-in one launch, accumulates dK/dV privately, and reduces dQ into GM using bfloat16
-atomic adds. Fusing Delta into the kernel partitioned by KV tile would repeat
+in one launch, accumulates dK/dV privately, and reduces dQ into GM using
+FP16 or BF16 atomic adds. Causal backward adds two residual GEMMs to improve
+dV and dK accuracy. Fusing Delta into the kernel partitioned by KV tile would repeat
 the `O * dO` reduction 64 times for the full shape, so both launches remain part
 of this implementation.
 
@@ -21,10 +22,12 @@ core_paged_decode.py  # Paged KV-cache decode kernel + host helpers
 example_mha.py   # MHA wrapper + reference + benchmark
 example_gqa.py   # GQA wrapper + reference + benchmark
 example_gqa_bwd.py
+example_gqa_bwd_tileops.py  # BSHD backward adapter with base-2 LSE input
 example_gqa_manual_schedule.py  # GQA with a validated fixed-stage schedule
 example_mha_paged_decode.py    # Paged decode wrapper + reference + benchmark
 test_mha.py / test_gqa.py / test_gqa_bwd.py
 test_mha_paged_decode.py
+test_gqa_bwd_tileops_spec.py  # CPU reference checks and FP16/BF16 workloads
 ```
 
 ## Paged MHA decode (`core_paged_decode.py`)
@@ -74,18 +77,24 @@ packing also uses a fixed 128x128 tile:
 - **Tile shapes are constrained.** `block_q` must be even, and
   `block_kv == 2 * VL == 128` (64 fp32 SIMD lanes). Both
   `q_len % block_q == 0` and `kv_len % block_kv == 0` must hold.
-- **Inputs must use bfloat16**, with float32 accumulation. The output dtype is
-  configurable: MHA writes float32 directly without a cast; GQA writes bfloat16
-  through an additional `vcvt` cast into a byte alias of `O_ub`, requiring no
-  extra UB storage.
-- **No causal mask.** Dropout, attention bias, variable lengths, and padding
-  masks are unsupported.
-- **Backward currently supports only the flattened GQA layout.** Inputs, `dO`,
-  and output gradients use bfloat16. dQ uses BF16 atomic adds across KV tiles.
-  Tiles are fixed at 128x128. There is no MHA backward wrapper yet, although its
-  mathematical formulation is equivalent to `G=1`.
+- **The shared MHA/GQA forward builder uses bfloat16 inputs**, with float32
+  accumulation. MHA writes float32 output; GQA writes bfloat16 output.
+  Backward supports native float16 and bfloat16 inputs and gradients.
+- **The shared MHA/GQA forward builder has no causal mask.** Backward supports
+  square causal attention via `is_causal=True, groups=G`, with sequence-major
+  flattened Q rows `[S * G, D]`. It requires O and natural-log LSE from the
+  corresponding causal forward. The paged decode path has separate causal
+  support described above. Dropout, attention bias, variable lengths, and
+  padding masks are unsupported by the shared dense forward/backward path.
+- **The backward builder uses a flattened GQA layout.** The
+  `example_gqa_bwd_tileops.py` adapter accepts BSHD tensors, processes each
+  batch/KV-head group, and converts FP32 base-2 LSE `[B,H,S]` to natural log.
+  It supports `G=1` as well as grouped heads, but does not register a TileOPs
+  backend. dQ uses 16-bit atomic adds across KV tiles.
 - **Staged backward requires at least three query tiles:** `q_len / 128 >= 3`.
-  Four Q/dO buffer versions do not increase the minimum input size.
+  Q/KV lengths must be multiples of 128. Causal calls require
+  `q_len == kv_len * groups`. Q/dO use two buffer versions with both residual
+  compensations enabled, three with one, and four with neither.
 - **GQA `num_blocks` must divide `q_len / block_q`**, the number of M tiles,
   to avoid an uneven workload across cores.
 
@@ -103,6 +112,9 @@ fused BF16 outputs have relative L2 errors of approximately
 1.024% / 0.316% / 0.037% for dQ/dK/dV against Torch BF16 gradients. The larger dQ
 error comes from repeated BF16 rounding during atomic accumulation across
 64 KV tiles.
+
+The backward performance figures below describe the original non-causal BF16
+path, not the causal residual-compensated or FP16 paths.
 
 Backward measurements were collected on 2026-09-24 using Ascend950DT,
 CANN/Bisheng 9.2.0, and a local build of TileLang `8121f415` with fast-math
@@ -199,4 +211,31 @@ ASCEND_NPU_ARCH=dav-3510 python example_gqa_bwd.py --no-perf
 ASCEND_NPU_ARCH=dav-3510 TILELANG_DISABLE_CACHE=1 python example_gqa_manual_schedule.py
 # Or run the correctness tests
 ASCEND_NPU_ARCH=dav-3510 TILELANG_DISABLE_CACHE=1 python -m pytest test_mha.py test_gqa.py test_gqa_bwd.py -v
+```
+
+### TileOPs-shaped GQA backward correctness
+
+`example_gqa_bwd_tileops.py::gqa_bwd` accepts Q/K/V/O/dO in BSHD layout and
+FP32 base-2 LSE in `[B,H,S]`, returning dQ/dK/dV. O and LSE must come from the
+same forward computation, with the same causal mode and scale `1/sqrt(D)`.
+This adapter does not add causal support to the dense forward builder.
+
+`test_gqa_bwd_tileops_spec.py` uses explicit FP32 PyTorch matmul, causal masking,
+softmax, and autograd as its reference. The reference is independently checked
+against CPU SDPA MATH. Reference gradients are cast to the input dtype before
+comparison. Every gradient element must satisfy
+`abs(actual - reference) <= atol + rtol * abs(reference)`:
+
+| Dtype | atol | rtol |
+|---|---:|---:|
+| float16 | 0.005 | 0.001 |
+| bfloat16 | 0.016 | 0.016 |
+
+The suite contains two CPU checks, six small NPU cases, and sixteen NPU cases
+covering eight default TileOPs shapes in both dtypes. These are adapter accuracy
+checks, not end-to-end TileOPs backend integration or performance tests.
+
+```bash
+# Run from examples/ascend/flash_attention; requires torch_npu and an NPU
+ASCEND_NPU_ARCH=dav-3510 python -m pytest test_gqa_bwd_tileops_spec.py -v -s
 ```
