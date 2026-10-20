@@ -17,11 +17,49 @@ of this implementation.
 ```
 core.py          # Shared flash_attention_fwd builder + FwdTiling
 core_bwd.py      # Delta and T.Stage AutoSchedule fused builders
+core_paged_decode.py  # Paged KV-cache decode kernel + host helpers
 example_mha.py   # MHA wrapper + reference + benchmark
 example_gqa.py   # GQA wrapper + reference + benchmark
 example_gqa_bwd.py
 example_gqa_manual_schedule.py  # GQA with a validated fixed-stage schedule
+example_mha_paged_decode.py    # Paged decode wrapper + reference + benchmark
 test_mha.py / test_gqa.py / test_gqa_bwd.py
+test_mha_paged_decode.py
+```
+
+## Paged MHA decode (`core_paged_decode.py`)
+
+Decoding attention over a paged KV cache:
+`O = softmax(Q @ K^T / sqrt(d)) @ V` where K/V live in row pools addressed
+through a per-request page table. One block serves one `(batch, head)` pair and
+walks 128-row key tiles with an online softmax; probabilities are packed in NZ
+layout for the second GEMM. A key tile never straddles a page — pages of 256
+rows walk as two sub-blocks whose page id and in-page offset the block computes
+at run time, so a fragmented (shuffled) page table costs nothing.
+
+The host side owns two inputs the kernel cannot compute while walking whole
+tiles: an additive float32 attention bias (`0` visible / `-1e30` cut; the
+online softmax turns a fully cut tile into an exact zero contribution) and
+sanitized pools (unread rows zeroed so NaN-poisoned pool rows never reach the
+output). `run_decode` wires both together.
+
+- **Shapes:** `seqlen_q <= 16`, `dim` a multiple of 64 (128 exercised by the
+  NZ-packing path), `page_size` 128 or a multiple of it, `float16`/`bfloat16`.
+- **Causal:** supported for `seqlen_q > 1`; a query that sees no key keeps
+  exact zeros.
+- **Memory-bound:** the benchmark reports effective HBM bandwidth (bytes the
+  kernel must move / kernel time). On Ascend 950 a large-cache shape
+  (`B=2 H=32 kv=16384 D=128 p=256`, 256 MB of K+V pools) sustains about
+  1.31 TB/s — roughly 91% of the ~1.44 TB/s device copy bandwidth and at the
+  ceiling of its strided (256 B segments, 8 KB row stride) access pattern.
+
+```bash
+# Correctness + benchmark
+ASCEND_NPU_ARCH=dav-3510 python example_mha_paged_decode.py
+# Correctness only
+ASCEND_NPU_ARCH=dav-3510 python example_mha_paged_decode.py --no-perf
+# Or via pytest
+ASCEND_NPU_ARCH=dav-3510 python -m pytest test_mha_paged_decode.py -v
 ```
 
 ## Limitations
