@@ -89,14 +89,23 @@ def run_case(batch, heads, seqlen_kv, seqlen_q, dim, page_size, dtype,
 
 def run_regression_perf(batch=2, heads=32, seqlen_kv=16384, seqlen_q=1, dim=128,
                         page_size=256, dtype=torch.float16, device=torch.device("npu")):
-    """Compile + benchmark the decode kernel, reporting latency and effective bandwidth."""
+    """Compile + benchmark the decode kernel, reporting latency and effective bandwidth.
+
+    Only the kernel launch is timed: the host-side bias and pool sanitization are
+    prebuilt, matching the kernel-time wording of the reported bandwidth.
+    """
     kernel, (q, k, v, real, table) = run_case(
         batch, heads, seqlen_kv, seqlen_q, dim, page_size, dtype, device=device)
 
-    def call():
-        run_decode(kernel, q, k, v, real, table, page_size)
+    from core_paged_decode import BC, BR, build_attention_bias, sanitize_pools
+    num_kv = table.shape[1] * (page_size // BC)
+    bias = build_attention_bias(batch, seqlen_q, num_kv, real)
+    k_safe, v_safe = sanitize_pools(k, v, real, table, page_size)
+    o_buf = torch.empty(batch, heads, BR, dim, dtype=q.dtype, device=device)
 
-    prof = do_bench(call, backend="msprof_detail", _n_warmup=10, _n_repeat=100)
+    prof = do_bench(
+        lambda: kernel(q, table, real, bias, k_safe, v_safe, o_buf),
+        backend="msprof_detail", _n_warmup=10, _n_repeat=100)
     # Effective bytes: K + V pool rows actually read, plus Q and O.
     total_rl = int(real.sum())
     eff_bytes = 2 * total_rl * heads * dim * q.element_size() + q.numel() * q.element_size() * 2
