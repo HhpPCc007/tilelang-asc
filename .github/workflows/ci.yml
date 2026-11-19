@@ -1,6 +1,7 @@
 name: CI
 on:
   pull_request:
+    branches-ignore: ['**']  # auto-trigger off; see ascend950-ci.yml
     types:
       - labeled
       - unlabeled
@@ -767,7 +768,7 @@ jobs:
 
       - name: Run CuTeDSL examples with Python 3.12 (CUDA-auto)
         env:
-          TILELANG_TARGET: cutedsl
+          TILELANG_DEFAULT_TARGET: cutedsl
         run: |
           cd testing
           PYTEST=(
